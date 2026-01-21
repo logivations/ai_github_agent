@@ -1,0 +1,14 @@
+
+services:
+  ci-agent:
+    build: .
+    ports:
+      - "8009:8009"
+    environment:
+      - DRONE_SERVER=https://drone.logivations.com
+      - DRONE_TOKEN=${DRONE_TOKEN}
+      - GITHUB_TOKEN=${GITHUB_TOKEN}
+      - CLAUDE_API_KEY=${CLAUDE_API_KEY}
+    volumes:
+      - /data:/data:ro
+    restart: unless-stopped
