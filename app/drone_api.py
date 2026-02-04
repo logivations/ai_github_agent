@@ -19,7 +19,6 @@ def extract_tests(build: dict) -> list[dict]:
 
     for stage in build.get("stages", []):
         stage_name = stage.get("name")
-        stage_status = stage.get("status")
 
         for step in stage.get("steps", []):
             results.append({

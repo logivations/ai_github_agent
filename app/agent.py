@@ -1,17 +1,23 @@
+from __future__ import annotations
+
 from datetime import datetime, timezone
 import subprocess
 
-from app.drone_api import get_build, extract_tests
-from app.github_api import (
-    upsert_pr_comment,
-    find_pr_for_commit,
-)
-from app.llm import  ask_claude
-
+from app.drone_api import get_build
+from app.github_api import find_pr_for_commit, upsert_pr_comment
+from app.llm import ask_claude
 
 BUILD_BY_SHA: dict[str, int] = {}
 
-def cache_build_from_status(payload: dict):
+SKIP_LABELS = {
+    "draft",
+    "do not review",
+}
+PIPLENE_STAGES={
+    "pre-commit"
+}
+
+def cache_build_from_status(payload: dict) -> None:
     target = payload.get("target_url")
     sha = payload.get("sha")
 
@@ -31,31 +37,12 @@ def tail(text: str, n: int = 200) -> str:
     return "\n".join(lines[-n:])
 
 
-def get_step_logs_cli(
-    repo: str,
-    build_number: int,
-    stage_number: int,
-    step_number: int,
-) -> str:
-
-    cmd = [
-        "drone",
-        "log",
-        "view",
-        repo,
-        str(build_number),
-        str(stage_number),
-        str(step_number),
-    ]
-
-    return subprocess.check_output(
-        cmd,
-        text=True,
-        stderr=subprocess.STDOUT,
-    )
+def get_step_logs_cli(repo: str, build_number: int, stage_number: int, step_number: int) -> str:
+    cmd = ["drone", "log", "view", repo, str(build_number), str(stage_number), str(step_number)]
+    return subprocess.check_output(cmd, text=True, stderr=subprocess.STDOUT)
 
 
-async def run_agent(payload: dict):
+async def run_agent(payload: dict) -> None:
     print("[AGENT] run_agent", flush=True)
 
     repo = payload["repository"]["full_name"]
@@ -63,12 +50,27 @@ async def run_agent(payload: dict):
 
     build_number = BUILD_BY_SHA.get(sha)
     if not build_number:
-        print("[AGENT] no build number → exit", flush=True)
+        print("[AGENT] no build number - exit", flush=True)
         return
 
-    pr_number = await find_pr_for_commit(repo, sha)
+    pr = await find_pr_for_commit(repo, sha)
+    if not pr:
+        print("[AGENT] no PR   exit", flush=True)
+        return
+
+    if pr.get("draft"):
+        print("[AGENT] draft PR skip comment", flush=True)
+        return
+
+
+    labels = {l.get("name", "").strip().lower() for l in pr.get("labels", []) if isinstance(l, dict)}
+    if labels & SKIP_LABELS:
+        print(f"[AGENT] skip by label(s): {sorted(labels & SKIP_LABELS)}", flush=True)
+        return
+
+    pr_number = pr.get("number")
     if not pr_number:
-        print("[AGENT] no PR → exit", flush=True)
+        print("[AGENT] PR has no number - exit", flush=True)
         return
 
     build = await get_build(repo, build_number)
@@ -76,102 +78,70 @@ async def run_agent(payload: dict):
         print("[AGENT] failed to fetch build", flush=True)
         return
 
-    tests = extract_tests(build)
-    failed = [t for t in tests if t["status"] != "success"]
-
-    status_emoji = "✅" if not failed else "❌"
-    status_text = "SUCCESS" if not failed else "FAILURE"
-
-    if failed:
-        failed_block = "\n".join(
-            f"- **{t['stage']} / {t['step']}**"
-            for t in failed
-        )
-    else:
-        failed_block = "_No failed steps_"
-
-
-    suggestions = []
-
-    if any("pre-commit" in t["step"].lower() for t in failed):
-        suggestions.append(
-            "- Run `pre-commit run --all-files` locally"
-        )
-
-    if any("system" in t["stage"].lower() for t in failed):
-        suggestions.append(
-            "- System tests failed — check available **mcap rosbags** in artifacts"
-        )
-
-    suggestions_block = (
-        "\n".join(suggestions)
-        if suggestions
-        else "_No suggestions_"
-    )
-
-    failed_steps = []
+    failed_steps: list[dict] = []
+    logs_blocks: list[str] = []
 
     for stage in build.get("stages", []):
         for step in stage.get("steps", []):
-            if step.get("status") == "failure":
-                raw_logs = get_step_logs_cli(
-                    repo,
-                    build_number,
-                    stage["number"],
-                    step["number"],
-                )
+            if step.get("status") != "failure":
+                continue
 
-                failed_steps.append({
-                    "stage": stage["name"],
-                    "step": step["name"],
-                    "logs": tail(raw_logs, 200),
-                })
+            raw_logs = get_step_logs_cli(
+                repo,
+                build_number,
+                stage.get("number"),
+                step.get("number"),
+            )
+            logs_tail = tail(raw_logs, 200)
+
+            failed_steps.append(
+                {
+                    "stage": stage.get("name"),
+                    "step": step.get("name"),
+                    "logs": logs_tail,
+                }
+            )
+
+            logs_blocks.append(
+                f"""<details>
+<summary><b>{stage.get('name')} / {step.get('name')}</b></summary>
+
+{logs_tail}
+
+</details>"""
+            )
 
     if failed_steps:
-        print(f"[AGENT] Analyzing {len(failed_steps)} failed step(s)")
-        # analysis_md = await ask_claude(repo, build_number, failed_steps)
-        analysis_md = f"{len(failed_steps)}failures detected_"
+        has_pre_commit_failure = any(
+            (s.get("step") or "").strip().lower() == "pre-commit"
+            for s in failed_steps
+        )
+
+        if has_pre_commit_failure:
+            print("[AGENT] pre-commit failure - skip LLM analysis", flush=True)
+            analysis_md = (
+                "### Additional Fix\n"
+                "- Run `pre-commit run --all-files` locally to fix formatting/linting"
+            )
+        else:
+            print(f"[AGENT] Analyzing {len(failed_steps)} failed step(s)", flush=True)
+            analysis_md = await ask_claude(repo, build_number, failed_steps)
     else:
         analysis_md = "_No failures detected_"
-        print("[AGENT] No failures to analyze")
-
-    analysis_lower = analysis_md.lower()
-
-    if any("pre-commit" in s["step"].lower() for s in failed_steps):
-        if "pre-commit run --all-files" not in analysis_lower:
-            analysis_md += "\n\n### Additional Fix\n- Run `pre-commit run --all-files` locally to fix formatting/linting"
+        print("[AGENT] No failures to analyze", flush=True)
 
 
-    logs_blocks = []
+    logs_section = "\n".join(logs_blocks) if logs_blocks else "_No failed step logs_"
 
-    for stage in build.get("stages", []):
-        for step in stage.get("steps", []):
-            if step.get("status") == "failure":
-                raw_logs = get_step_logs_cli(
-                    repo,
-                    build_number,
-                    stage["number"],
-                    step["number"],
-                )
-
-                logs_blocks.append(
-                    f"""
-<details>
-<summary><b>{stage['name']} / {step['name']}</b></summary>
-
-{tail(raw_logs, 200)}
-
-</details>
-""")
-
-    logs_section = "\n".join(logs_blocks)
-
-    comment = f"""
-## CI Summary
+    comment = f"""## CI Summary
 
 {analysis_md}
 
- **Drone build:**  
+
+### Failed step logs
+{logs_section}
+
+**Drone build:**  
 https://drone.logivations.com/{repo}/{build_number}
 
 _Last updated: {datetime.now(timezone.utc).isoformat()}_

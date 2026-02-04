@@ -1,7 +1,6 @@
 import os
 import httpx
-import os
-import httpx
+from typing import Any
 
 GITHUB_TOKEN = os.environ["GITHUB_TOKEN"]
 MARKER = "<!-- CI-AGENT -->"
@@ -12,8 +11,7 @@ HEADERS = {
 }
 
 
-async def find_pr_for_commit(repo: str, sha: str) -> int | None:
-
+async def find_pr_for_commit(repo: str, sha: str) -> dict[str, Any] | None:
     url = f"https://api.github.com/repos/{repo}/commits/{sha}/pulls"
 
     headers = {
@@ -32,9 +30,8 @@ async def find_pr_for_commit(repo: str, sha: str) -> int | None:
         if not prs:
             return None
 
-        return prs[0]["number"]
-
-
+        pr = prs[0]
+        return pr if isinstance(pr, dict) else None
 
 
 async def upsert_pr_comment(repo: str, pr_number: int, body: str):

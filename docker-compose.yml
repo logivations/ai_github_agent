@@ -1,9 +1,8 @@
-
 services:
   ci-agent:
     build: .
     ports:
-      - "8009:8009"
+      - "8012:8012"
     environment:
       - DRONE_SERVER=https://drone.logivations.com
       - DRONE_TOKEN=${DRONE_TOKEN}
